@@ -1,0 +1,619 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// ACE PO3 Bot — Power of 3 · STDV · PD Arrays · OHLC/OLHC · MMXM
+// Built for MNQ / MES, NY session, 1m–5m chart.
+//@version=6
+strategy("ACE PO3 Bot — PO3 · STDV · PD Arrays · MMXM", shorttitle = "ACE PO3 Bot", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, initial_capital = 50000, default_qty_type = strategy.fixed, default_qty_value = 2, commission_type = strategy.commission.cash_per_contract, commission_value = 0.62, slippage = 1, pyramiding = 0)
+
+extraFlat = strategy.position_size == 0
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Model (from your notes):
+//   1. ACCUMULATION  – overnight range builds liquidity (PO3 phase 1)
+//   2. MANIPULATION  – price sweeps buy-side or sell-side liquidity (PO3 phase 2)
+//   3. CISD / MSS    – close through the last opposing candle run (MMXM shift)
+//   4. PD ARRAY      – retest of an FVG, iFVG or order block → ENTRY
+//   5. DISTRIBUTION  – targets from STDV pulled off the manipulation leg
+//                      (-2/-2.5 = retrace zone → TP1, -4/-4.5 = reversal → TP2)
+//   Bias filter: OHLC / OLHC of a higher-timeframe candle (default 4H)
+//   MMXM: reaching -4 STDV prints a model switch (MMSM ⇄ MMBM)
+// ═══════════════════════════════════════════════════════════════════════════
+
+TZ = "America/New_York"
+
+// ───────────────────────────── INPUTS ─────────────────────────────
+grpSes    = "Sessions (New York time)"
+tradeSess = input.session("0930-1130", "Trade window / kill zone", group = grpSes)
+accSess   = input.session("1800-0930", "Accumulation range (liquidity build)", group = grpSes)
+flatSess  = input.session("1555-1800", "Flatten window (be flat before 16:59 for Apex)", group = grpSes)
+
+grpLiq  = "Manipulation = liquidity sweep (PO3)"
+useAcc  = input.bool(true, "Sweep of accumulation range high / low", group = grpLiq)
+usePD   = input.bool(true, "Sweep of previous day high / low", group = grpLiq)
+usePiv  = input.bool(true, "Sweep of most recent swing high / low", group = grpLiq)
+pivLen  = input.int(5, "Swing strength (bars each side)", minval = 2, group = grpLiq)
+legLook = input.int(20, "Manipulation leg lookback (bars)", minval = 3, group = grpLiq)
+maxWait = input.int(30, "Setup expires after N bars without entry", minval = 3, group = grpLiq)
+
+grpPDA  = "PD array entry"
+useFVG  = input.bool(true, "FVG retest", group = grpPDA)
+useIFVG = input.bool(true, "iFVG retest", group = grpPDA)
+useOB   = input.bool(true, "Order block retest", group = grpPDA)
+reqCISD = input.bool(true, "Require CISD / market structure shift first (MMXM)", group = grpPDA)
+minGapT = input.int(2, "Minimum FVG size (ticks)", minval = 0, group = grpPDA)
+
+grpSD    = "Standard deviations (targets)"
+sdMethod = input.string("Wick to wick", "STDV anchor", options = ["Wick to wick", "Wick to body"], group = grpSD)
+tp1Str   = input.string("-2", "TP1 deviation", options = ["-1", "-2", "-2.5", "-4", "-4.5"], group = grpSD)
+tp2Str   = input.string("-4", "TP2 deviation", options = ["-1", "-2", "-2.5", "-4", "-4.5"], group = grpSD)
+tp1Pct   = input.int(50, "% of position closed at TP1", minval = 1, maxval = 100, group = grpSD)
+moveBE   = input.bool(true, "Move stop to breakeven after TP1", group = grpSD)
+
+grpRisk    = "Risk"
+slBufT     = input.int(4, "Stop buffer beyond manipulation extreme (ticks)", minval = 0, group = grpRisk)
+minRR      = input.float(1.5, "Minimum reward:risk to TP1", minval = 0, step = 0.25, group = grpRisk)
+maxStopPts = input.float(0, "Max stop size in points (0 = off)", minval = 0, group = grpRisk)
+maxTrades  = input.int(2, "Max trades per day", minval = 1, group = grpRisk)
+
+grpBias  = "Bias (OHLC / OLHC)"
+biasMode = input.string("HTF candle PO3", "Bias filter", options = ["HTF candle PO3", "Off"], group = grpBias)
+biasTF   = input.timeframe("240", "Bias candle timeframe", group = grpBias)
+biasThr  = input.float(0.5, "Manipulation threshold (x ATR)", minval = 0, step = 0.1, group = grpBias)
+
+grpVis    = "Visuals"
+showSD    = input.bool(true, "Draw STDV levels on each signal", group = grpVis)
+showZone  = input.bool(true, "Draw the PD array used for entry", group = grpVis)
+showLiq   = input.bool(true, "Show liquidity levels", group = grpVis)
+showDash  = input.bool(true, "Show dashboard", group = grpVis)
+tintBias  = input.bool(false, "Tint background by bias", group = grpVis)
+
+colBull = color.new(#26a69a, 0)
+colBear = color.new(#ef5350, 0)
+colSD   = color.new(#b39ddb, 0)
+
+// ───────────────────────────── BASICS ─────────────────────────────
+tick    = syminfo.mintick
+atr     = ta.atr(14)
+tp1X    = str.tonumber(tp1Str)
+tp2X    = str.tonumber(tp2Str)
+tp1Frac = tp1Pct / 100.0
+inTrade = not na(time(timeframe.period, tradeSess, TZ))
+inAcc   = not na(time(timeframe.period, accSess, TZ))
+inFlat  = not na(time(timeframe.period, flatSess, TZ))
+newDay  = timeframe.change("D")
+
+legLo     = ta.lowest(low, legLook)
+legLoBody = ta.lowest(math.min(open, close), legLook)
+legHi     = ta.highest(high, legLook)
+legHiBody = ta.highest(math.max(open, close), legLook)
+
+// ───────────────────── 1. ACCUMULATION / LIQUIDITY ─────────────────────
+var float accHi = na
+var float accLo = na
+var bool accHiTaken = false
+var bool accLoTaken = false
+if inAcc and not inAcc[1]
+    accHi := high
+    accLo := low
+    accHiTaken := false
+    accLoTaken := false
+else if inAcc
+    accHi := math.max(accHi, high)
+    accLo := math.min(accLo, low)
+accDone = not inAcc and not na(accHi)
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1], lookahead = barmerge.lookahead_on)
+var bool pdhTaken = false
+var bool pdlTaken = false
+if newDay
+    pdhTaken := false
+    pdlTaken := false
+
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+var float swHi = na
+var float swLo = na
+var bool swHiTaken = false
+var bool swLoTaken = false
+if not na(ph)
+    swHi := ph
+    swHiTaken := false
+if not na(pl)
+    swLo := pl
+    swLoTaken := false
+
+// ───────────────────── 2. MANIPULATION (sweeps) ─────────────────────
+bslSwept = false
+sslSwept = false
+if useAcc and accDone and not accHiTaken and high > accHi
+    accHiTaken := true
+    bslSwept := true
+if useAcc and accDone and not accLoTaken and low < accLo
+    accLoTaken := true
+    sslSwept := true
+if usePD and not na(pdh) and not pdhTaken and high > pdh
+    pdhTaken := true
+    bslSwept := true
+if usePD and not na(pdl) and not pdlTaken and low < pdl
+    pdlTaken := true
+    sslSwept := true
+if usePiv and not na(swHi) and not swHiTaken and high > swHi
+    swHiTaken := true
+    bslSwept := true
+if usePiv and not na(swLo) and not swLoTaken and low < swLo
+    swLoTaken := true
+    sslSwept := true
+
+// ───────────────────── BIAS: OHLC / OLHC of HTF candle ─────────────────────
+htfNew = timeframe.change(biasTF)
+var float hO = na
+var float hH = na
+var float hL = na
+if htfNew or na(hO)
+    hO := open
+    hH := high
+    hL := low
+else
+    hH := math.max(hH, high)
+    hL := math.min(hL, low)
+thr = atr * biasThr
+upM = hH - hO >= thr
+dnM = hO - hL >= thr
+int htfBias = 0
+if upM and not dnM
+    htfBias := -1          // manipulated up first → expect OHLC (bearish distribution)
+else if dnM and not upM
+    htfBias := 1           // manipulated down first → expect OLHC (bullish distribution)
+else if upM and dnM
+    htfBias := close < hO ? -1 : 1
+biasOn  = biasMode != "Off"
+shortOK = not biasOn or htfBias == -1
+longOK  = not biasOn or htfBias == 1
+
+// ───────────────────── FVG history (for iFVG) ─────────────────────
+gapMin  = minGapT * tick
+bullFVG = bar_index >= 2 and low > high[2] and (low - high[2]) >= gapMin
+bearFVG = bar_index >= 2 and high < low[2] and (low[2] - high) >= gapMin
+
+var bullTop = array.new<float>()
+var bullBot = array.new<float>()
+var bullBar = array.new<int>()
+var bearTop = array.new<float>()
+var bearBot = array.new<float>()
+var bearBar = array.new<int>()
+
+// ───────────────────── SIMULATED POSITION (gating + stats) ─────────────────────
+var int   simDir   = 0
+var int   simBar   = 0
+var float simEntry = na
+var float simStop  = na
+var float simT1    = na
+var float simT2    = na
+var float simRisk  = na
+var bool  simT1Hit = false
+var int   nWins    = 0
+var int   nLoss    = 0
+var int   nBE      = 0
+var float netR     = 0.0
+
+if simDir != 0 and bar_index > simBar
+    float exitPx = na
+    string exitTxt = ""
+    if inFlat
+        exitPx := close
+        exitTxt := "Flat"
+    else if simDir == 1
+        if low <= simStop
+            exitPx := simStop
+            exitTxt := simT1Hit ? "BE" : "SL"
+        else
+            if not simT1Hit and high >= simT1
+                simT1Hit := true
+                netR += tp1Frac * (simT1 - simEntry) / simRisk
+                if tp1Frac >= 1
+                    exitPx := simT1
+                    exitTxt := "TP1"
+                else if moveBE
+                    simStop := simEntry
+            if na(exitPx) and high >= simT2
+                exitPx := simT2
+                exitTxt := "TP2"
+    else
+        if high >= simStop
+            exitPx := simStop
+            exitTxt := simT1Hit ? "BE" : "SL"
+        else
+            if not simT1Hit and low <= simT1
+                simT1Hit := true
+                netR += tp1Frac * (simEntry - simT1) / simRisk
+                if tp1Frac >= 1
+                    exitPx := simT1
+                    exitTxt := "TP1"
+                else if moveBE
+                    simStop := simEntry
+            if na(exitPx) and low <= simT2
+                exitPx := simT2
+                exitTxt := "TP2"
+    if not na(exitPx)
+        remFrac = simT1Hit ? 1 - tp1Frac : 1.0
+        netR += remFrac * simDir * (exitPx - simEntry) / simRisk
+        if simT1Hit or exitTxt == "TP2"
+            nWins += 1
+        else if exitPx * simDir > simEntry * simDir
+            nWins += 1
+        else if exitPx == simEntry
+            nBE += 1
+        else
+            nLoss += 1
+        label.new(bar_index, exitPx, exitTxt, style = label.style_label_left, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
+        simDir := 0
+
+var int tradesToday = 0
+if newDay
+    tradesToday := 0
+flat = simDir == 0 and extraFlat
+
+// ───────────────────── CANDLE RUNS (for CISD / OB) ─────────────────────
+isUp = close > open
+isDn = close < open
+var float upRunOpen = na
+var float upRunHigh = na
+var float dnRunOpen = na
+var float dnRunLow  = na
+
+// ───────────────────── SETUP STATE ─────────────────────
+var bool  sArmed = false
+var int   sBar   = 0
+var float sExt   = na      // STDV "1"  (manipulation high)
+var float sStart = na      // STDV "0"  (start of manipulation leg)
+var bool  sCISD  = false
+var sZT   = array.new<float>()
+var sZB   = array.new<float>()
+var sZBar = array.new<int>()
+var sZTyp = array.new<string>()
+
+var bool  lArmed = false
+var int   lBar   = 0
+var float lExt   = na      // STDV "1"  (manipulation low)
+var float lStart = na      // STDV "0"
+var bool  lCISD  = false
+var lZT   = array.new<float>()
+var lZB   = array.new<float>()
+var lZBar = array.new<int>()
+var lZTyp = array.new<string>()
+
+// SHORT side: buy-side liquidity taken → look for sells
+sFresh  = (bslSwept and not sArmed) or (sArmed and sCISD and high > sExt)
+sExtend = not sFresh and sArmed and high > sExt
+if sFresh
+    sArmed := true
+    sBar   := bar_index
+    sExt   := high
+    sStart := sdMethod == "Wick to body" ? legLoBody : legLo
+    sCISD  := false
+    array.clear(sZT)
+    array.clear(sZB)
+    array.clear(sZBar)
+    array.clear(sZTyp)
+    lArmed := false        // BSL reached = long draw on liquidity delivered
+else if sExtend
+    sExt := high
+    sBar := bar_index
+
+// LONG side: sell-side liquidity taken → look for buys
+lFresh  = (sslSwept and not lArmed) or (lArmed and lCISD and low < lExt)
+lExtend = not lFresh and lArmed and low < lExt
+if lFresh
+    lArmed := true
+    lBar   := bar_index
+    lExt   := low
+    lStart := sdMethod == "Wick to body" ? legHiBody : legHi
+    lCISD  := false
+    array.clear(lZT)
+    array.clear(lZB)
+    array.clear(lZBar)
+    array.clear(lZTyp)
+    if not sFresh
+        sArmed := false
+else if lExtend
+    lExt := low
+    lBar := bar_index
+
+if sArmed and bar_index - sBar > maxWait
+    sArmed := false
+if lArmed and bar_index - lBar > maxWait
+    lArmed := false
+
+// ───────────────────── 3. CISD + ORDER BLOCKS ─────────────────────
+if sArmed and not sCISD and not na(upRunOpen) and close < upRunOpen
+    sCISD := true
+    if useOB
+        array.push(sZT, upRunHigh)
+        array.push(sZB, upRunOpen)
+        array.push(sZBar, bar_index)
+        array.push(sZTyp, "OB")
+if lArmed and not lCISD and not na(dnRunOpen) and close > dnRunOpen
+    lCISD := true
+    if useOB
+        array.push(lZT, dnRunOpen)
+        array.push(lZB, dnRunLow)
+        array.push(lZBar, bar_index)
+        array.push(lZTyp, "OB")
+
+// update candle runs after the CISD check
+if isUp
+    if not (close[1] > open[1])
+        upRunOpen := open
+        upRunHigh := high
+    else
+        upRunHigh := math.max(upRunHigh, high)
+if isDn
+    if not (close[1] < open[1])
+        dnRunOpen := open
+        dnRunLow  := low
+    else
+        dnRunLow := math.min(dnRunLow, low)
+
+// ───────────────────── 4. PD ARRAYS: FVG + iFVG ─────────────────────
+if bearFVG and sArmed and useFVG
+    array.push(sZT, low[2])
+    array.push(sZB, high)
+    array.push(sZBar, bar_index)
+    array.push(sZTyp, "FVG")
+if bullFVG and lArmed and useFVG
+    array.push(lZT, low)
+    array.push(lZB, high[2])
+    array.push(lZBar, bar_index)
+    array.push(lZTyp, "FVG")
+
+// inversions: bullish FVG closed through → bearish iFVG (and vice versa)
+if array.size(bullTop) > 0
+    for i = array.size(bullTop) - 1 to 0
+        if close < array.get(bullBot, i)
+            if sArmed and useIFVG and array.get(bullBar, i) >= sBar - legLook
+                array.push(sZT, array.get(bullTop, i))
+                array.push(sZB, array.get(bullBot, i))
+                array.push(sZBar, bar_index)
+                array.push(sZTyp, "iFVG")
+            array.remove(bullTop, i)
+            array.remove(bullBot, i)
+            array.remove(bullBar, i)
+if array.size(bearTop) > 0
+    for i = array.size(bearTop) - 1 to 0
+        if close > array.get(bearTop, i)
+            if lArmed and useIFVG and array.get(bearBar, i) >= lBar - legLook
+                array.push(lZT, array.get(bearTop, i))
+                array.push(lZB, array.get(bearBot, i))
+                array.push(lZBar, bar_index)
+                array.push(lZTyp, "iFVG")
+            array.remove(bearTop, i)
+            array.remove(bearBot, i)
+            array.remove(bearBar, i)
+
+// store this bar's new FVGs in history
+if bullFVG
+    array.push(bullTop, low)
+    array.push(bullBot, high[2])
+    array.push(bullBar, bar_index)
+    if array.size(bullTop) > 30
+        array.shift(bullTop)
+        array.shift(bullBot)
+        array.shift(bullBar)
+if bearFVG
+    array.push(bearTop, low[2])
+    array.push(bearBot, high)
+    array.push(bearBar, bar_index)
+    if array.size(bearTop) > 30
+        array.shift(bearTop)
+        array.shift(bearBot)
+        array.shift(bearBar)
+
+// ───────────────────── 5. ENTRY SIGNALS ─────────────────────
+canShort = sArmed and (sCISD or not reqCISD) and inTrade and flat and shortOK and tradesToday < maxTrades
+canLong  = lArmed and (lCISD or not reqCISD) and inTrade and flat and longOK and tradesToday < maxTrades
+
+bool   shortSig = false
+bool   longSig  = false
+string sigType  = ""
+float  sigTop   = na
+float  sigBot   = na
+int    sigZBar  = na
+float  sigStop  = na
+float  sigTP1   = na
+float  sigTP2   = na
+float  sigOne   = na
+float  sigZero  = na
+int    sigLeg   = na
+
+// SHORT: retest of a bearish PD array, bearish close back below it
+if sArmed and array.size(sZT) > 0
+    for i = array.size(sZT) - 1 to 0
+        zt = array.get(sZT, i)
+        zb = array.get(sZB, i)
+        if close > zt
+            array.remove(sZT, i)
+            array.remove(sZB, i)
+            array.remove(sZBar, i)
+            array.remove(sZTyp, i)
+        else if not shortSig and canShort and array.get(sZBar, i) < bar_index and high >= zb and isDn
+            shortSig := true
+            sigType  := array.get(sZTyp, i)
+            sigTop   := zt
+            sigBot   := zb
+            sigZBar  := array.get(sZBar, i)
+if shortSig
+    one  = sExt
+    zero = sStart
+    L    = one - zero
+    stp  = one + slBufT * tick
+    t1   = zero + tp1X * L
+    t2   = zero + tp2X * L
+    risk = stp - close
+    rr   = risk > 0 ? (close - t1) / risk : 0.0
+    if L > 0 and risk > 0 and rr >= minRR and (maxStopPts == 0 or risk <= maxStopPts)
+        sigStop := stp
+        sigTP1  := t1
+        sigTP2  := t2
+        sigOne  := one
+        sigZero := zero
+        sigLeg  := sBar
+        sArmed  := false
+    else
+        shortSig := false
+
+// LONG: retest of a bullish PD array, bullish close back above it
+if lArmed and array.size(lZT) > 0
+    for i = array.size(lZT) - 1 to 0
+        zt = array.get(lZT, i)
+        zb = array.get(lZB, i)
+        if close < zb
+            array.remove(lZT, i)
+            array.remove(lZB, i)
+            array.remove(lZBar, i)
+            array.remove(lZTyp, i)
+        else if not longSig and not shortSig and canLong and array.get(lZBar, i) < bar_index and low <= zt and isUp
+            longSig := true
+            sigType := array.get(lZTyp, i)
+            sigTop  := zt
+            sigBot  := zb
+            sigZBar := array.get(lZBar, i)
+if longSig
+    one  = lExt
+    zero = lStart
+    L    = one - zero          // negative for longs → deviations project upward
+    stp  = one - slBufT * tick
+    t1   = zero + tp1X * L
+    t2   = zero + tp2X * L
+    risk = close - stp
+    rr   = risk > 0 ? (t1 - close) / risk : 0.0
+    if L < 0 and risk > 0 and rr >= minRR and (maxStopPts == 0 or risk <= maxStopPts)
+        sigStop := stp
+        sigTP1  := t1
+        sigTP2  := t2
+        sigOne  := one
+        sigZero := zero
+        sigLeg  := lBar
+        lArmed  := false
+    else
+        longSig := false
+
+// open simulated position
+if shortSig or longSig
+    simDir   := longSig ? 1 : -1
+    simBar   := bar_index
+    simEntry := close
+    simStop  := sigStop
+    simT1    := sigTP1
+    simT2    := sigTP2
+    simRisk  := math.abs(close - sigStop)
+    simT1Hit := false
+    tradesToday += 1
+
+// ───────────────────── MMXM state + switch at -4 STDV ─────────────────────
+var string mmModel = "—"
+var int    mmDir   = 0
+var float  mm4     = na
+if shortSig
+    mmModel := "MMSM → targeting SSL"
+    mmDir   := -1
+    mm4     := sigZero + (-4.0) * (sigOne - sigZero)
+if longSig
+    mmModel := "MMBM → targeting BSL"
+    mmDir   := 1
+    mm4     := sigZero + (-4.0) * (sigOne - sigZero)
+if mmDir == -1 and low <= mm4
+    label.new(bar_index, low, "MMXM switch\nMMSM → MMBM (-4 STDV)", style = label.style_label_up, color = color.new(colSD, 20), textcolor = color.white, size = size.small)
+    mmModel := "Switch: watch for MMBM"
+    mmDir   := 0
+if mmDir == 1 and high >= mm4
+    label.new(bar_index, high, "MMXM switch\nMMBM → MMSM (-4 STDV)", style = label.style_label_down, color = color.new(colSD, 20), textcolor = color.white, size = size.small)
+    mmModel := "Switch: watch for MMSM"
+    mmDir   := 0
+
+// ───────────────────── DRAWING ─────────────────────
+drawSD(int x1, float one, float zero) =>
+    float L  = one - zero
+    int   x2 = bar_index + 40
+    for lv in array.from(1.0, 0.0, -1.0, -2.0, -2.5, -4.0, -4.5)
+        float y = zero + lv * L
+        bool key = lv == -2.0 or lv == -2.5 or lv == -4.0 or lv == -4.5
+        line.new(x1, y, x2, y, color = color.new(colSD, key ? 0 : 50), style = key ? line.style_solid : line.style_dotted, width = 1)
+        label.new(x2, y, str.tostring(lv) + "  " + str.tostring(y, format.mintick), style = label.style_label_left, color = color(na), textcolor = colSD, size = size.tiny)
+    float a1 = zero - 2.0 * L
+    float a2 = zero - 2.5 * L
+    float b1 = zero - 4.0 * L
+    float b2 = zero - 4.5 * L
+    box.new(x1, math.max(a1, a2), x2, math.min(a1, a2), border_color = color(na), bgcolor = color.new(colSD, 85))
+    box.new(x1, math.max(b1, b2), x2, math.min(b1, b2), border_color = color(na), bgcolor = color.new(colSD, 78))
+
+if shortSig or longSig
+    c = longSig ? colBull : colBear
+    if showSD
+        drawSD(sigLeg - legLook, sigOne, sigZero)
+    if showZone
+        box.new(sigZBar, sigTop, bar_index, sigBot, border_color = c, bgcolor = color.new(c, 85), text = sigType, text_color = c, text_size = size.tiny)
+    txt = (longSig ? "BUY · " : "SELL · ") + sigType + "\nSL  " + str.tostring(sigStop, format.mintick) + "\nTP1 " + str.tostring(sigTP1, format.mintick) + " (" + tp1Str + ")" + "\nTP2 " + str.tostring(sigTP2, format.mintick) + " (" + tp2Str + ")"
+    if longSig
+        label.new(bar_index, low, txt, style = label.style_label_up, color = c, textcolor = color.white, size = size.small)
+    else
+        label.new(bar_index, high, txt, style = label.style_label_down, color = c, textcolor = color.white, size = size.small)
+
+plotshape(longSig, "Buy", shape.triangleup, location.belowbar, colBull, size = size.tiny)
+plotshape(shortSig, "Sell", shape.triangledown, location.abovebar, colBear, size = size.tiny)
+plotshape(bslSwept, "BSL sweep", shape.xcross, location.abovebar, color.new(colBear, 50), size = size.tiny)
+plotshape(sslSwept, "SSL sweep", shape.xcross, location.belowbar, color.new(colBull, 50), size = size.tiny)
+
+plot(showLiq and accDone ? accHi : na, "Accumulation high", color.new(color.orange, 30), 1, plot.style_linebr)
+plot(showLiq and accDone ? accLo : na, "Accumulation low", color.new(color.orange, 30), 1, plot.style_linebr)
+plot(showLiq ? pdh : na, "PDH", color.new(color.gray, 40), 1, plot.style_linebr)
+plot(showLiq ? pdl : na, "PDL", color.new(color.gray, 40), 1, plot.style_linebr)
+bgcolor(tintBias and biasOn ? (htfBias == 1 ? color.new(colBull, 93) : htfBias == -1 ? color.new(colBear, 93) : na) : na)
+
+var table dash = table.new(position.top_right, 2, 8, bgcolor = color.new(#131722, 10), border_color = color.new(color.gray, 70), border_width = 1)
+if showDash and barstate.islast
+    biasTxt = htfBias == -1 ? "Bearish (OHLC)" : htfBias == 1 ? "Bullish (OLHC)" : "Neutral"
+    biasCol = htfBias == -1 ? colBear : htfBias == 1 ? colBull : color.gray
+    table.cell(dash, 0, 0, "ACE PO3", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, inTrade ? "In kill zone" : "Outside window", text_color = inTrade ? colBull : color.gray, text_size = size.small)
+    table.cell(dash, 0, 1, "Bias " + biasTF, text_color = color.gray, text_size = size.small)
+    table.cell(dash, 1, 1, biasOn ? biasTxt : "Off", text_color = biasCol, text_size = size.small)
+    table.cell(dash, 0, 2, "MMXM", text_color = color.gray, text_size = size.small)
+    table.cell(dash, 1, 2, mmModel, text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 3, "Short setup", text_color = color.gray, text_size = size.small)
+    table.cell(dash, 1, 3, sArmed ? (sCISD ? "Armed · CISD ✓" : "Swept BSL · wait CISD") : "—", text_color = colBear, text_size = size.small)
+    table.cell(dash, 0, 4, "Long setup", text_color = color.gray, text_size = size.small)
+    table.cell(dash, 1, 4, lArmed ? (lCISD ? "Armed · CISD ✓" : "Swept SSL · wait CISD") : "—", text_color = colBull, text_size = size.small)
+    table.cell(dash, 0, 5, "Trades today", text_color = color.gray, text_size = size.small)
+    table.cell(dash, 1, 5, str.tostring(tradesToday) + " / " + str.tostring(maxTrades), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 6, "Sim W / L / BE", text_color = color.gray, text_size = size.small)
+    table.cell(dash, 1, 6, str.tostring(nWins) + " / " + str.tostring(nLoss) + " / " + str.tostring(nBE), text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 7, "Sim net R", text_color = color.gray, text_size = size.small)
+    table.cell(dash, 1, 7, str.tostring(netR, "#.##") + "R", text_color = netR >= 0 ? colBull : colBear, text_size = size.small)
+
+// ───────────────────── ALERT PAYLOAD (JSON for webhooks) ─────────────────────
+sigMsg = (shortSig or longSig) ? '{"action":"' + (longSig ? "buy" : "sell") + '","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + ',"stop":' + str.tostring(sigStop, format.mintick) + ',"tp1":' + str.tostring(sigTP1, format.mintick) + ',"tp2":' + str.tostring(sigTP2, format.mintick) + ',"setup":"' + sigType + '"}' : ""
+if shortSig or longSig
+    alert(sigMsg, alert.freq_once_per_bar_close)
+
+// ═══════════════════════ ORDER EXECUTION (bot) ═══════════════════════
+var float liveT2 = na
+if longSig
+    liveT2 := sigTP2
+    strategy.entry("Long", strategy.long, comment = "BUY " + sigType, alert_message = sigMsg)
+    strategy.exit("L-TP1", from_entry = "Long", qty_percent = tp1Pct, stop = sigStop, limit = sigTP1, comment_profit = "TP1", comment_loss = "SL")
+    strategy.exit("L-Run", from_entry = "Long", stop = sigStop, limit = sigTP2, comment_profit = "TP2", comment_loss = "SL")
+if shortSig
+    liveT2 := sigTP2
+    strategy.entry("Short", strategy.short, comment = "SELL " + sigType, alert_message = sigMsg)
+    strategy.exit("S-TP1", from_entry = "Short", qty_percent = tp1Pct, stop = sigStop, limit = sigTP1, comment_profit = "TP1", comment_loss = "SL")
+    strategy.exit("S-Run", from_entry = "Short", stop = sigStop, limit = sigTP2, comment_profit = "TP2", comment_loss = "SL")
+
+// breakeven on the runner once TP1 fills
+if moveBE and strategy.position_size > 0 and strategy.position_size < strategy.position_size[1]
+    strategy.exit("L-Run", from_entry = "Long", stop = strategy.position_avg_price, limit = liveT2, comment_profit = "TP2", comment_loss = "BE")
+if moveBE and strategy.position_size < 0 and strategy.position_size > strategy.position_size[1]
+    strategy.exit("S-Run", from_entry = "Short", stop = strategy.position_avg_price, limit = liveT2, comment_profit = "TP2", comment_loss = "BE")
+
+// hard flatten (Apex: flat before 4:59 PM ET)
+if inFlat and strategy.position_size != 0
+    strategy.close_all(comment = "Flatten")

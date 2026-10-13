@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+cpp/build/
+data/*.csv
+data/*.png
+.DS_Store
